@@ -62,6 +62,23 @@ static volatile LONG exit_code = 0;
 static volatile LONG frames = 0;
 static volatile LONG keyframes = 0;
 
+/* Frames wait here for the writer thread. The encoder's thread must never block on
+ * stdout: a pipe holds a few KB, and while the reader is busy (ffmpeg writing a
+ * segment to disk) a blocked encoder makes libobs skip frames, which shows up as a
+ * clip that freezes in and out. OBS's own outputs write from their own thread too. */
+struct qnode {
+	struct qnode *next;
+	size_t size;
+	uint8_t data[];
+};
+#define QUEUE_MAX ((size_t)256 << 20) /* about 100 s at 20 Mb/s */
+static SRWLOCK qlock = SRWLOCK_INIT;
+static CONDITION_VARIABLE qcv = CONDITION_VARIABLE_INIT;
+static struct qnode *qhead, *qtail;
+static size_t qbytes, qpeak;
+static bool qdropping, writer_stop;
+static volatile LONG dropped = 0;
+
 /* Logging ----------------------------------------------------------------- */
 
 static void log_handler(int level, const char *fmt, va_list args, void *param)
@@ -195,19 +212,73 @@ static void pipe_packet(void *data, struct encoder_packet *pkt)
 	if (pkt->timebase_den > 0 && !(pkt->timebase_num == 1 && (uint32_t)pkt->timebase_den == fps))
 		pts = (int64_t)((double)pkt->pts * pkt->timebase_num * fps / pkt->timebase_den + 0.5);
 
-	uint8_t fh[12];
-	put_u32(fh, (uint32_t)(extra_size + pkt->size));
-	put_u64(fh + 4, (uint64_t)(pts < 0 ? 0 : pts));
-	bool ok = write_all(fh, sizeof(fh)) && (!extra_size || write_all(extra, extra_size)) &&
-		  write_all(pkt->data, pkt->size);
-	if (!ok) {
-		/* The reader went away: stop. */
-		InterlockedExchange(&running, 0);
+	size_t size = 12 + extra_size + pkt->size;
+	struct qnode *n = malloc(sizeof(*n) + size);
+	if (!n)
+		return;
+	n->next = NULL;
+	n->size = size;
+	put_u32(n->data, (uint32_t)(extra_size + pkt->size));
+	put_u64(n->data + 4, (uint64_t)(pts < 0 ? 0 : pts));
+	if (extra_size)
+		memcpy(n->data + 12, extra, extra_size);
+	memcpy(n->data + 12 + extra_size, pkt->data, pkt->size);
+
+	AcquireSRWLockExclusive(&qlock);
+	/* Reader far behind: drop frames until the next keyframe rather than grow forever. */
+	if (qdropping && pkt->keyframe && qbytes + size <= QUEUE_MAX / 2)
+		qdropping = false;
+	if (!qdropping && qbytes + size > QUEUE_MAX)
+		qdropping = true;
+	if (qdropping) {
+		ReleaseSRWLockExclusive(&qlock);
+		free(n);
+		InterlockedIncrement(&dropped);
 		return;
 	}
+	if (qtail)
+		qtail->next = n;
+	else
+		qhead = n;
+	qtail = n;
+	qbytes += size;
+	if (qbytes > qpeak)
+		qpeak = qbytes;
+	ReleaseSRWLockExclusive(&qlock);
+	WakeConditionVariable(&qcv);
 	InterlockedIncrement(&frames);
 	if (pkt->keyframe)
 		InterlockedIncrement(&keyframes);
+}
+
+/* Drains the queue into stdout. Ends when told to stop and the queue is empty, or
+ * when the reader goes away. */
+static DWORD WINAPI writer_thread(LPVOID param)
+{
+	(void)param;
+	for (;;) {
+		AcquireSRWLockExclusive(&qlock);
+		while (!qhead && !writer_stop)
+			SleepConditionVariableSRW(&qcv, &qlock, 100, 0);
+		struct qnode *n = qhead;
+		if (n) {
+			qhead = n->next;
+			if (!qhead)
+				qtail = NULL;
+			qbytes -= n->size;
+		}
+		ReleaseSRWLockExclusive(&qlock);
+		if (!n)
+			break; /* stopping, and nothing left */
+		bool ok = write_all(n->data, n->size);
+		free(n);
+		if (!ok) {
+			/* The reader went away: stop. */
+			InterlockedExchange(&running, 0);
+			break;
+		}
+	}
+	return 0;
 }
 
 static struct obs_output_info pipe_info = {
@@ -531,6 +602,7 @@ int main(int argc, char **argv)
 	say("recording %ux%u -> %ux%u at %u fps with %s, %u kbps%s", canvas_w, canvas_h, out_w, out_h, fps, enc_id,
 	    kbps, game ? ", game capture on" : "");
 
+	HANDLE writer = CreateThread(NULL, 0, writer_thread, NULL, 0, NULL);
 	CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
 	uint64_t last_report = os_gettime_ns();
 	uint64_t mismatch_since = 0;
@@ -563,12 +635,23 @@ int main(int argc, char **argv)
 		if (now - last_report > 10000000000ULL) {
 			last_report = now;
 			video_t *v = obs_get_video();
-			say("frames %ld, keyframes %ld, skipped %u of %u, lagged %u", frames, keyframes,
-			    video_output_get_skipped_frames(v), video_output_get_total_frames(v), obs_get_lagged_frames());
+			AcquireSRWLockShared(&qlock);
+			size_t queued = qbytes, peak = qpeak;
+			ReleaseSRWLockShared(&qlock);
+			say("frames %ld, keyframes %ld, skipped %u of %u, lagged %u, queued %zu KB (peak %zu KB), dropped %ld",
+			    frames, keyframes, video_output_get_skipped_frames(v), video_output_get_total_frames(v),
+			    obs_get_lagged_frames(), queued >> 10, peak >> 10, dropped);
 		}
 	}
 
 	obs_output_force_stop(output);
+	/* Let what's queued reach the reader (briefly), then stop the writer. */
+	AcquireSRWLockExclusive(&qlock);
+	writer_stop = true;
+	ReleaseSRWLockExclusive(&qlock);
+	WakeConditionVariable(&qcv);
+	if (writer)
+		WaitForSingleObject(writer, 2000);
 	obs_output_release(output);
 	obs_encoder_release(encoder);
 	obs_set_output_source(0, NULL);
