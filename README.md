@@ -4,7 +4,10 @@ The Windows screen and game recorder behind [ache](https://ache.gg), built on
 OBS Studio's engine ([libobs](https://github.com/obsproject/obs-studio)).
 
 It records the screen and any fullscreen game, **including exclusive fullscreen**,
-using OBS's own signed game-capture hook. The picture is scaled and encoded on the
+using OBS's own signed game-capture hook. Games whose anti-cheat blocks that hook
+(Roblox, for one; OBS keeps the list in win-capture's `compatibility.json`) are
+recorded through their window with Windows.Graphics.Capture instead, automatically,
+while they're in front. The picture is scaled and encoded on the
 GPU (NVIDIA NVENC, AMD AMF or Intel QuickSync; x264 as a last resort) and written
 to stdout as a stream of timestamped frames.
 

@@ -27,6 +27,12 @@
  * Control: the program runs until stdin closes or reads "q", then stops cleanly.
  * Logs go to stderr.
  *
+ * Games that block the hook (Roblox's anti-cheat, for one) give game capture black
+ * frames. OBS lists them in win-capture's compatibility.json ("Game Capture is
+ * blocked"); while one of those is the foreground window, ache-capture stops hooking
+ * and records that window with Windows.Graphics.Capture (window_capture) instead,
+ * until the window closes. EXTRA_BLOCKED adds games OBS's list doesn't have yet.
+ *
  * Following the game (--follow-game): the canvas should be the game's own size, not
  * the monitor's (a 1920x1080 game on a 5120x1440 screen would otherwise sit small in
  * the middle). libobs can't resize the canvas while encoding, so when a hooked game's
@@ -47,6 +53,8 @@
 #include <obs-output.h>
 #include <util/base.h>
 #include <util/platform.h>
+#include <util/dstr.h>
+#include <ctype.h>
 
 #include <windows.h>
 #include <stdarg.h>
@@ -78,6 +86,9 @@ static struct qnode *qhead, *qtail;
 static size_t qbytes, qpeak;
 static bool qdropping, writer_stop;
 static volatile LONG dropped = 0;
+
+/* Games whose anti-cheat blocks the hook, beyond OBS's list (lowercase .exe names). */
+static const char *EXTRA_BLOCKED[] = {NULL};
 
 /* Logging ----------------------------------------------------------------- */
 
@@ -417,6 +428,122 @@ static obs_data_t *encoder_settings(const char *id, uint32_t kbps)
 	return s;
 }
 
+/* Blocked games -------------------------------------------------------------- */
+
+static char **blocked;
+static size_t blocked_count;
+
+static void add_blocked(const char *exe)
+{
+	if (!exe || !*exe)
+		return;
+	char *lower = bstrdup(exe);
+	for (char *c = lower; *c; c++)
+		*c = (char)tolower((unsigned char)*c);
+	for (size_t i = 0; i < blocked_count; i++)
+		if (!strcmp(blocked[i], lower)) {
+			bfree(lower);
+			return;
+		}
+	blocked = brealloc(blocked, sizeof(char *) * (blocked_count + 1));
+	blocked[blocked_count++] = lower;
+}
+
+/* OBS's own list of games that block Game Capture, from win-capture's data. */
+static void load_blocked(void)
+{
+	obs_data_t *d = obs_data_create_from_json_file("../../core/win-capture/data/compatibility.json");
+	obs_data_array_t *entries = d ? obs_data_get_array(d, "entries") : NULL;
+	size_t n = entries ? obs_data_array_count(entries) : 0;
+	for (size_t i = 0; i < n; i++) {
+		obs_data_t *e = obs_data_array_item(entries, i);
+		const char *key = obs_data_get_string(e, "translation_key");
+		if (obs_data_get_bool(e, "game_capture") && strstr(key, "GameCapture.Blocked"))
+			add_blocked(obs_data_get_string(e, "executable"));
+		obs_data_release(e);
+	}
+	obs_data_array_release(entries);
+	obs_data_release(d);
+	for (const char **x = EXTRA_BLOCKED; *x; x++)
+		add_blocked(*x);
+	say("%zu games use window capture instead of the game hook", blocked_count);
+}
+
+/* The .exe name of a window's process, lowercase ("" if unknown). */
+static void window_exe(HWND w, char *out, size_t size)
+{
+	out[0] = 0;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(w, &pid);
+	HANDLE p = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+	if (!p)
+		return;
+	wchar_t path[MAX_PATH];
+	DWORD len = MAX_PATH;
+	if (QueryFullProcessImageNameW(p, 0, path, &len)) {
+		const wchar_t *base = wcsrchr(path, L'\\');
+		WideCharToMultiByte(CP_UTF8, 0, base ? base + 1 : path, -1, out, (int)size, NULL, NULL);
+		for (char *c = out; *c; c++)
+			*c = (char)tolower((unsigned char)*c);
+	}
+	CloseHandle(p);
+}
+
+static bool is_blocked(const char *exe)
+{
+	for (size_t i = 0; i < blocked_count; i++)
+		if (!strcmp(blocked[i], exe))
+			return true;
+	return false;
+}
+
+/* window_capture's "window" setting: title:class:exe, with ':' and '#' escaped. */
+static void append_escaped(struct dstr *s, const wchar_t *w)
+{
+	char *u = NULL;
+	os_wcs_to_utf8_ptr(w, 0, &u);
+	for (const char *c = u ? u : ""; *c; c++) {
+		if (*c == ':')
+			dstr_cat(s, "#3A");
+		else if (*c == '#')
+			dstr_cat(s, "#22");
+		else
+			dstr_cat_ch(s, *c);
+	}
+	bfree(u);
+}
+
+static void point_window_capture(obs_source_t *src, HWND w, const char *exe)
+{
+	wchar_t title[256] = L"", cls[256] = L"", wexe[MAX_PATH] = L"";
+	GetWindowTextW(w, title, 256);
+	GetClassNameW(w, cls, 256);
+	MultiByteToWideChar(CP_UTF8, 0, exe, -1, wexe, MAX_PATH);
+	struct dstr s = {0};
+	append_escaped(&s, title);
+	dstr_cat_ch(&s, ':');
+	append_escaped(&s, cls);
+	dstr_cat_ch(&s, ':');
+	append_escaped(&s, wexe);
+	obs_data_t *ws = obs_data_create();
+	obs_data_set_string(ws, "window", s.array);
+	obs_data_set_int(ws, "priority", 2); /* match by executable first */
+	obs_data_set_int(ws, "method", 2);   /* Windows.Graphics.Capture */
+	obs_data_set_bool(ws, "cursor", true);
+	obs_data_set_bool(ws, "client_area", true);
+	obs_source_update(src, ws);
+	obs_data_release(ws);
+	dstr_free(&s);
+}
+
+static void set_game_mode(obs_source_t *game_src, const char *mode)
+{
+	obs_data_t *gs = obs_data_create();
+	obs_data_set_string(gs, "capture_mode", mode);
+	obs_source_update(game_src, gs);
+	obs_data_release(gs);
+}
+
 static void usage(void)
 {
 	fputs("usage: ache-capture --monitor \\\\.\\DISPLAY1 --canvas WxH --size WxH --fps N\n"
@@ -558,7 +685,10 @@ int main(int argc, char **argv)
 		fit(screen_item, canvas_w, canvas_h);
 	}
 
-	obs_source_t *game_src = NULL;
+	obs_source_t *game_src = NULL, *window_src = NULL;
+	obs_sceneitem_t *window_item = NULL;
+	HWND blocked_window = NULL;
+	uint64_t last_fg_check = 0;
 	if (game) {
 		obs_data_t *gs = obs_data_create();
 		obs_data_set_string(gs, "capture_mode", "any_fullscreen");
@@ -571,6 +701,19 @@ int main(int argc, char **argv)
 		obs_data_release(gs);
 		if (game_src)
 			fit(obs_scene_add(scene, game_src), canvas_w, canvas_h);
+
+		/* For games that block the hook: their window, off until one is in front. */
+		load_blocked();
+		obs_data_t *ws = obs_data_create();
+		obs_data_set_int(ws, "method", 2);
+		window_src = obs_source_create("window_capture", "window", ws, NULL);
+		obs_data_release(ws);
+		if (window_src) {
+			window_item = obs_scene_add(scene, window_src);
+			fit(window_item, canvas_w, canvas_h);
+			obs_sceneitem_set_visible(window_item, false);
+			obs_source_set_enabled(window_src, false);
+		}
 	}
 	obs_set_output_source(0, obs_scene_get_source(scene));
 
@@ -609,9 +752,34 @@ int main(int argc, char **argv)
 	while (running) {
 		Sleep(50);
 		uint64_t now = os_gettime_ns();
+		/* A game that blocks the hook in front: record its window instead, until it closes. */
+		if (window_src && now - last_fg_check > 500000000ULL) {
+			last_fg_check = now;
+			if (blocked_window && !IsWindow(blocked_window)) {
+				say("blocked game closed: back to the game hook");
+				blocked_window = NULL;
+				obs_sceneitem_set_visible(window_item, false);
+				obs_source_set_enabled(window_src, false);
+				set_game_mode(game_src, "any_fullscreen");
+			}
+			HWND fg = GetForegroundWindow();
+			char exe[MAX_PATH];
+			if (fg && fg != blocked_window) {
+				window_exe(fg, exe, sizeof(exe));
+				if (*exe && is_blocked(exe)) {
+					say("%s blocks the game hook: recording its window instead", exe);
+					blocked_window = fg;
+					set_game_mode(game_src, "hotkey"); /* stop hooking it */
+					point_window_capture(window_src, fg, exe);
+					obs_source_set_enabled(window_src, true);
+					obs_sceneitem_set_visible(window_item, true);
+				}
+			}
+		}
 		if (follow && game_src) {
-			/* The size the canvas should be: the hooked game's, else the screen's. */
-			uint32_t gw = obs_source_get_width(game_src), gh = obs_source_get_height(game_src);
+			/* The size the canvas should be: the game's (hooked, or its window), else the screen's. */
+			obs_source_t *g = blocked_window ? window_src : game_src;
+			uint32_t gw = obs_source_get_width(g), gh = obs_source_get_height(g);
 			/* While a game is hooked it covers the canvas: stop duplicating the desktop
 			 * underneath (a 5120x1440 screen every frame is real GPU work). */
 			bool hooked = gw && gh;
@@ -655,6 +823,8 @@ int main(int argc, char **argv)
 	obs_output_release(output);
 	obs_encoder_release(encoder);
 	obs_set_output_source(0, NULL);
+	if (window_src)
+		obs_source_release(window_src);
 	if (game_src)
 		obs_source_release(game_src);
 	if (screen)
