@@ -27,13 +27,20 @@
  * Control: the program runs until stdin closes or reads "q", then stops cleanly.
  * Logs go to stderr.
  *
+ * Following the game (--follow-game): the canvas should be the game's own size, not
+ * the monitor's (a 1920x1080 game on a 5120x1440 screen would otherwise sit small in
+ * the middle). libobs can't resize the canvas while encoding, so when a hooked game's
+ * size differs from the canvas (or the game is gone and the canvas isn't the
+ * screen's) for 0.75 s, it prints "[ache-capture] canvas WxH" and exits with code 10.
+ * The caller restarts it with --canvas WxH.
+ *
  * Usage
  *   ache-capture --monitor \\.\DISPLAY1 --canvas 5120x1440 --size 4096x1152
  *                --fps 60 --encoder nvenc --codec h264 --kbps 20000 [--adapter 0]
- *                [--no-game]
+ *                [--screen 5120x1440 --follow-game] [--no-game]
  *
  * Exit codes: 0 stopped, 2 bad arguments, 3 libobs/video setup failed,
- * 4 encoder failed, 5 output failed.
+ * 4 encoder failed, 5 output failed, 10 restart with the canvas it printed.
  */
 
 #include <obs.h>
@@ -343,7 +350,7 @@ static void usage(void)
 {
 	fputs("usage: ache-capture --monitor \\\\.\\DISPLAY1 --canvas WxH --size WxH --fps N\n"
 	      "                    --encoder nvenc|amf|qsv|x264 [--codec h264|hevc] [--kbps N]\n"
-	      "                    [--adapter N] [--no-game]\n",
+	      "                    [--adapter N] [--screen WxH --follow-game] [--no-game]\n",
 	      stderr);
 }
 
@@ -353,13 +360,18 @@ int main(int argc, char **argv)
 	const char *enc_name = "nvenc";
 	const char *codec = "h264";
 	uint32_t canvas_w = 0, canvas_h = 0, out_w = 0, out_h = 0, kbps = 20000, adapter = 0;
-	bool game = true;
+	uint32_t screen_w = 0, screen_h = 0;
+	bool game = true, follow = false;
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
 		if (!strcmp(a, "--no-game")) {
 			game = false;
+			continue;
+		}
+		if (!strcmp(a, "--follow-game")) {
+			follow = true;
 			continue;
 		}
 		if (!v) {
@@ -372,6 +384,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--canvas") && parse_size(v, &canvas_w, &canvas_h))
 			;
 		else if (!strcmp(a, "--size") && parse_size(v, &out_w, &out_h))
+			;
+		else if (!strcmp(a, "--screen") && parse_size(v, &screen_w, &screen_h))
 			;
 		else if (!strcmp(a, "--fps"))
 			fps = (uint32_t)atoi(v);
@@ -396,6 +410,10 @@ int main(int argc, char **argv)
 		out_w = canvas_w;
 		out_h = canvas_h;
 	}
+	if (!screen_w) {
+		screen_w = canvas_w;
+		screen_h = canvas_h;
+	}
 	out_w &= ~1u;
 	out_h &= ~1u;
 
@@ -415,6 +433,9 @@ int main(int argc, char **argv)
 		}
 	}
 	out_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+	/* As OBS does: a busy game shouldn't starve capture of CPU time. (libobs-d3d11
+	 * also raises this process's GPU scheduling priority.) */
+	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 	base_set_log_handler(log_handler, NULL);
 
 	if (!obs_startup("en-US", NULL, NULL)) {
@@ -460,8 +481,11 @@ int main(int argc, char **argv)
 	obs_data_set_bool(ms, "capture_cursor", true);
 	obs_source_t *screen = obs_source_create("monitor_capture", "screen", ms, NULL);
 	obs_data_release(ms);
-	if (screen)
-		fit(obs_scene_add(scene, screen), canvas_w, canvas_h);
+	obs_sceneitem_t *screen_item = NULL;
+	if (screen) {
+		screen_item = obs_scene_add(scene, screen);
+		fit(screen_item, canvas_w, canvas_h);
+	}
 
 	obs_source_t *game_src = NULL;
 	if (game) {
@@ -509,9 +533,33 @@ int main(int argc, char **argv)
 
 	CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
 	uint64_t last_report = os_gettime_ns();
+	uint64_t mismatch_since = 0;
 	while (running) {
 		Sleep(50);
 		uint64_t now = os_gettime_ns();
+		if (follow && game_src) {
+			/* The size the canvas should be: the hooked game's, else the screen's. */
+			uint32_t gw = obs_source_get_width(game_src), gh = obs_source_get_height(game_src);
+			/* While a game is hooked it covers the canvas: stop duplicating the desktop
+			 * underneath (a 5120x1440 screen every frame is real GPU work). */
+			bool hooked = gw && gh;
+			if (screen_item && obs_sceneitem_visible(screen_item) == hooked) {
+				obs_sceneitem_set_visible(screen_item, !hooked);
+				obs_source_set_enabled(screen, !hooked);
+			}
+			uint32_t want_w = gw && gh ? gw : screen_w, want_h = gw && gh ? gh : screen_h;
+			if (want_w != canvas_w || want_h != canvas_h) {
+				if (!mismatch_since)
+					mismatch_since = now;
+				else if (now - mismatch_since > 750000000ULL) {
+					say("canvas %ux%u", want_w, want_h);
+					InterlockedExchange(&exit_code, 10);
+					break;
+				}
+			} else {
+				mismatch_since = 0;
+			}
+		}
 		if (now - last_report > 10000000000ULL) {
 			last_report = now;
 			video_t *v = obs_get_video();

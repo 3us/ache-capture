@@ -15,7 +15,8 @@ ffmpeg. Nothing else of ache is in here.
 
 ```
 ache-capture --monitor \\.\DISPLAY1 --canvas 5120x1440 --size 4096x1152 --fps 60 \
-             --encoder nvenc --codec h264 --kbps 20000 [--adapter 0] [--no-game]
+             --encoder nvenc --codec h264 --kbps 20000 [--adapter 0] \
+             [--screen 5120x1440 --follow-game] [--no-game]
 ```
 
 | Option | Meaning |
@@ -28,9 +29,12 @@ ache-capture --monitor \\.\DISPLAY1 --canvas 5120x1440 --size 4096x1152 --fps 60
 | `--codec` | `h264` (default) or `hevc` |
 | `--kbps` | Constant bitrate |
 | `--adapter` | GPU index (DXGI order) to render on |
+| `--screen` | The monitor's size, used as the canvas when no game is hooked (default: `--canvas`) |
+| `--follow-game` | Record at the hooked game's size: when it differs from the canvas for 0.75 s, print `[ache-capture] canvas WxH` and exit with code 10, to be restarted with `--canvas WxH` |
 | `--no-game` | Screen only, no game hook |
 
-It stops when stdin closes or reads `q`. Logs go to stderr.
+It stops when stdin closes or reads `q`. Logs go to stderr, including a line every
+10 s with frames written and frames skipped or lagged by libobs.
 
 Output is IVF: a 32-byte header, then for each frame a little-endian `u32` size, a
 `u64` timestamp in 1/fps units (skipped frames leave a gap) and the frame, Annex-B,
