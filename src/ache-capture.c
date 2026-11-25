@@ -20,9 +20,21 @@
  *   system memory.
  *
  * Output (stdout): IVF. A 32-byte header, then for each frame a u32 size, a u64
- * timestamp in 1/fps units (skipped frames leave a gap, so timing stays right)
- * and the frame (Annex-B, with SPS/PPS before every keyframe). ffmpeg reads it
- * with `-f ivf -i pipe:0 -c:v copy`.
+ * timestamp in 1/fps units and the frame (Annex-B, with SPS/PPS before every keyframe).
+ * ffmpeg reads it with `-f ivf -i pipe:0 -c:v copy`. libobs's output is constant frame
+ * rate: when its renderer misses a frame (the game has the GPU), it encodes the last
+ * picture again, so timestamps never jump but the picture repeats. Frames are only
+ * missing from the stream (a gap in the timestamps) if the reader falls ~100 s behind.
+ *
+ * Status (stderr), for ache to read:
+ *   [ache-capture] origin_ns N        once: the QueryPerformanceCounter time (ns) of
+ *                                     timestamp 0, so ache can place the video exactly
+ *   [ache-capture] stats frames=.. rendered=.. lagged=.. skipped=.. dropped=.. queued_kb=..
+ *                                     every second, counts since start: frames written,
+ *                                     frames libobs rendered, rendered late (repeated in
+ *                                     the video), skipped by the encoder, dropped here
+ *   [ache-capture] source game|window|screen   what's being recorded, on every change
+ *   [ache-capture] encoder ID         the encoder that's running
  *
  * Control: the program runs until stdin closes or reads "q", then stops cleanly.
  * Logs go to stderr.
@@ -57,6 +69,7 @@
 #include <ctype.h>
 
 #include <windows.h>
+#include <timeapi.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +82,7 @@ static volatile LONG running = 1;
 static volatile LONG exit_code = 0;
 static volatile LONG frames = 0;
 static volatile LONG keyframes = 0;
+static volatile LONG origin_said = 0;
 
 /* Frames wait here for the writer thread. The encoder's thread must never block on
  * stdout: a pipe holds a few KB, and while the reader is busy (ffmpeg writing a
@@ -222,6 +236,14 @@ static void pipe_packet(void *data, struct encoder_packet *pkt)
 	int64_t pts = pkt->pts;
 	if (pkt->timebase_den > 0 && !(pkt->timebase_num == 1 && (uint32_t)pkt->timebase_den == fps))
 		pts = (int64_t)((double)pkt->pts * pkt->timebase_num * fps / pkt->timebase_den + 0.5);
+
+	/* Where timestamp 0 sits on the system clock: libobs stamps each packet with the
+	 * QueryPerformanceCounter time of its frame (dts_usec, from the frame the encoder
+	 * started on), the same clock ache's audio uses. */
+	if (!origin_said && InterlockedExchange(&origin_said, 1) == 0) {
+		int64_t at_ns = pkt->dts_usec * 1000 - (int64_t)((double)pts * 1e9 / fps + 0.5);
+		say("origin_ns %lld", (long long)at_ns);
+	}
 
 	size_t size = 12 + extra_size + pkt->size;
 	struct qnode *n = malloc(sizeof(*n) + size);
@@ -634,6 +656,15 @@ int main(int argc, char **argv)
 	/* As OBS does: a busy game shouldn't starve capture of CPU time. (libobs-d3d11
 	 * also raises this process's GPU scheduling priority.) */
 	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+	/* Windows 11 puts windowless background processes on EcoQoS (efficiency cores, lower
+	 * clocks) and coarse timers; libobs's renderer then misses frame deadlines. Opt out,
+	 * as a foreground app would be. */
+	PROCESS_POWER_THROTTLING_STATE pt = {.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+					     .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+							    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+					     .StateMask = 0};
+	SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt));
+	timeBeginPeriod(1);
 	base_set_log_handler(log_handler, NULL);
 
 	if (!obs_startup("en-US", NULL, NULL)) {
@@ -695,7 +726,11 @@ int main(int argc, char **argv)
 		obs_data_set_bool(gs, "capture_cursor", true);
 		obs_data_set_bool(gs, "allow_transparency", false);
 		obs_data_set_bool(gs, "anti_cheat_hook", true);
-		obs_data_set_bool(gs, "limit_framerate", false);
+		/* The hook copies the game's frame on every Present it allows. Unlimited, that's
+		 * twice our frame rate (game-capture.c halves the interval); a game drawing 1000
+		 * frames a second then pays for 120 copies a second it doesn't need, inside its
+		 * own frame time. Limited, it copies at our frame rate. */
+		obs_data_set_bool(gs, "limit_framerate", true);
 		obs_data_set_bool(gs, "capture_overlays", false);
 		game_src = obs_source_create("game_capture", "game", gs, NULL);
 		obs_data_release(gs);
@@ -745,10 +780,14 @@ int main(int argc, char **argv)
 	say("recording %ux%u -> %ux%u at %u fps with %s, %u kbps%s", canvas_w, canvas_h, out_w, out_h, fps, enc_id,
 	    kbps, game ? ", game capture on" : "");
 
+	say("encoder %s", enc_id);
+	say("source screen");
+
 	HANDLE writer = CreateThread(NULL, 0, writer_thread, NULL, 0, NULL);
 	CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
-	uint64_t last_report = os_gettime_ns();
+	uint64_t last_report = os_gettime_ns(), last_stats = last_report;
 	uint64_t mismatch_since = 0;
+	const char *source = "screen";
 	while (running) {
 		Sleep(50);
 		uint64_t now = os_gettime_ns();
@@ -799,6 +838,23 @@ int main(int argc, char **argv)
 			} else {
 				mismatch_since = 0;
 			}
+		}
+		/* What's on the canvas: a hooked game, a blocked game's window, or the screen. */
+		const char *now_source = blocked_window ? "window"
+					 : (game_src && obs_source_get_width(game_src) && obs_source_get_height(game_src)) ? "game"
+					 : "screen";
+		if (strcmp(now_source, source)) {
+			source = now_source;
+			say("source %s", source);
+		}
+		if (now - last_stats >= 1000000000ULL) {
+			last_stats = now;
+			video_t *v = obs_get_video();
+			AcquireSRWLockShared(&qlock);
+			size_t queued = qbytes;
+			ReleaseSRWLockShared(&qlock);
+			say("stats frames=%ld rendered=%u lagged=%u skipped=%u dropped=%ld queued_kb=%zu", frames, obs_get_total_frames(),
+			    obs_get_lagged_frames(), video_output_get_skipped_frames(v), dropped, queued >> 10);
 		}
 		if (now - last_report > 10000000000ULL) {
 			last_report = now;

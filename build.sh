@@ -54,7 +54,7 @@ SYS="-isystem $XWIN/crt/include -isystem $XWIN/sdk/include/ucrt -isystem $XWIN/s
   -c "$HERE/src/ache-capture.c" -o "$GEN/ache-capture.obj"
 "${LLD_LINK:-$(command -v lld-link || echo "$LLVM/lld-link")}" /nologo /subsystem:console /out:"$GEN/ache-capture.exe" "$GEN/ache-capture.obj" "$GEN/obs.lib" \
   /libpath:"$XWIN/crt/lib/x86_64" /libpath:"$XWIN/sdk/lib/um/x86_64" /libpath:"$XWIN/sdk/lib/ucrt/x86_64" \
-  libcmt.lib libucrt.lib libvcruntime.lib kernel32.lib user32.lib
+  libcmt.lib libucrt.lib libvcruntime.lib kernel32.lib user32.lib winmm.lib
 
 # The folder it runs from, laid out like OBS so libobs finds its data and plugins:
 # bin/64bit/ (the exe and DLLs), data/libobs/, core/<plugin>/.
