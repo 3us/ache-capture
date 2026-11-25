@@ -63,7 +63,10 @@ mkdir -p "$DIST/bin/64bit" "$DIST/data" "$DIST/core"
 cp "$GEN/ache-capture.exe" "$DIST/bin/64bit/"
 for f in obs.dll libobs-d3d11.dll libobs-winrt.dll w32-pthreads.dll zlib.dll libcurl.dll \
          avcodec-62.dll avformat-62.dll avutil-60.dll avdevice-62.dll avfilter-11.dll swresample-6.dll swscale-9.dll \
-         librist.dll srt.dll libx264-164.dll datachannel.dll; do
+         librist.dll srt.dll libx264-164.dll datachannel.dll \
+         obs-nvenc-test.exe obs-amf-test.exe obs-qsv-test.exe; do
+  # the *-test.exe helpers: each encoder plugin starts one to check the GPU, and won't load
+  # without it ("CreateProcessW failed: 2", then "couldn't start module obs-nvenc")
   [ -f "$OBS/bin/64bit/$f" ] && cp "$OBS/bin/64bit/$f" "$DIST/bin/64bit/"
 done
 cp -R "$OBS/data/libobs" "$DIST/data/"
